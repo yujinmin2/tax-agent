@@ -1,11 +1,13 @@
 """
-세무사 에이전트 A — 웹 버전
+세무사 에이전트 A — 웹 버전 (RAG)
 Streamlit Cloud 배포용
 """
 
 import streamlit as st
 import anthropic
-from tax_knowledge_2026 import SYSTEM_PROMPT
+from pathlib import Path
+from tax_knowledge_2026 import BASE_PROMPT
+from rag import LawRetriever
 
 st.set_page_config(
     page_title="세무사 에이전트 A",
@@ -15,9 +17,36 @@ st.set_page_config(
 )
 
 st.title("🏛️ 세무사 에이전트 A")
-st.caption("2026년 한국 세법 전문 AI · claude-opus-4-7 · Adaptive Thinking")
+st.caption("2026년 한국 세법 전문 AI · claude-opus-4-7 · Adaptive Thinking · RAG")
+
+
+# ── RAG 인덱스 로드 (앱 수명 동안 1회) ─────────────
+@st.cache_resource
+def get_retriever():
+    root = Path(__file__).parent
+    chunks = root / "law_chunks.json"
+    embeddings = root / "law_embeddings.npy"
+    if not chunks.exists():
+        st.error("law_chunks.json 없음. build_index.py 먼저 실행하세요.")
+        st.stop()
+    voyage_key = st.secrets.get("VOYAGE_API_KEY", "")
+    return LawRetriever(chunks, embeddings, voyage_key)
+
+
+@st.cache_resource
+def get_client():
+    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+
+retriever = get_retriever()
+client = get_client()
+
 
 # ── 사이드바 ──────────────────────────────────────
+def _empty_stats():
+    return {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "turns": 0}
+
+
 with st.sidebar:
     st.header("⚙️ 메뉴")
 
@@ -34,7 +63,9 @@ with st.sidebar:
         col1, col2 = st.columns(2)
         col1.metric("대화 횟수", s["turns"])
         col2.metric("출력 토큰", f"{s['output']:,}")
-        st.caption(f"입력 {s['input']:,} | 캐시읽기 {s['cache_read']:,} | 캐시쓰기 {s['cache_write']:,}")
+        st.caption(
+            f"입력 {s['input']:,} | 캐시읽기 {s['cache_read']:,} | 캐시쓰기 {s['cache_write']:,}"
+        )
 
     st.divider()
     st.markdown(
@@ -49,23 +80,10 @@ with st.sidebar:
 
 
 # ── 세션 초기화 ────────────────────────────────────
-def _empty_stats():
-    return {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "turns": 0}
-
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "stats" not in st.session_state:
     st.session_state.stats = _empty_stats()
-
-
-# ── Anthropic 클라이언트 (앱 수명 동안 1회 생성) ─────
-@st.cache_resource
-def get_client():
-    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-
-
-client = get_client()
 
 
 # ── 대화 내역 출력 ─────────────────────────────────
@@ -84,22 +102,44 @@ if prompt := st.chat_input("세금 관련 질문을 입력하세요..."):
     with st.chat_message("assistant", avatar="🏛️"):
         status_placeholder = st.empty()
         response_placeholder = st.empty()
-        status_placeholder.markdown("*⏳ 분석 중...*")
+        status_placeholder.markdown("*⏳ 관련 조문 검색 중...*")
 
+        # ── RAG: 관련 조문 검색 ─────────────────────
+        # 대화 마지막 3턴 + 현재 질문으로 검색 (문맥 반영)
+        recent_ctx = " ".join(
+            m["content"] for m in st.session_state.messages[-6:]
+        )
+        retrieved = retriever.retrieve(recent_ctx, top_k=25)
+
+        # 시스템 프롬프트 구성
+        system_blocks = [
+            {
+                "type": "text",
+                "text": BASE_PROMPT,
+                "cache_control": {"type": "ephemeral"},  # BASE_PROMPT는 캐싱
+            }
+        ]
+        if retrieved:
+            system_blocks.append({
+                "type": "text",
+                "text": (
+                    "\n\n══════════════════════════════\n"
+                    "【이번 질문과 관련된 실제 법령 조문 (law.go.kr 2026)】\n"
+                    "아래 조문을 우선 인용하여 답변하세요.\n"
+                    "══════════════════════════════\n\n"
+                    + retrieved
+                ),
+            })
+
+        status_placeholder.markdown("*⏳ 분석 중...*")
         full_response = ""
         started = False
 
         with client.messages.stream(
             model="claude-opus-4-7",
-            max_tokens=4096,
+            max_tokens=8192,
             thinking={"type": "adaptive"},
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            system=system_blocks,
             messages=st.session_state.messages,
         ) as stream:
             for text in stream.text_stream:

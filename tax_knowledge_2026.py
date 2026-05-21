@@ -4,6 +4,33 @@ from pathlib import Path
 
 _LAW_TEXTS_DIR = Path(__file__).parent  # 법령 파일은 스크립트와 같은 폴더
 
+# 컨텍스트 윈도우(1M 토큰) 초과 방지: 법률별 최대 문자 수
+# 법률 원문은 더 많이, 시행령/규칙은 적게 할당
+_LAW_CHAR_LIMITS = {
+    # 법률 원문 — 핵심 조문 위주 (앞부분이 중요)
+    "국세기본법_clean.txt":           60_000,
+    "소득세법_clean.txt":             60_000,
+    "법인세법_clean.txt":             60_000,
+    "부가가치세법_clean.txt":         60_000,
+    "상속세및증여세법_clean.txt":     60_000,
+    "조세특례제한법_clean.txt":       60_000,
+    "종합부동산세법_clean.txt":       26_000,  # 전체 포함 (25K)
+    # 시행령 — 계산식·기준 위주 (앞부분 위주)
+    "국세기본법시행령_clean.txt":         30_000,
+    "소득세법시행령_clean.txt":           40_000,
+    "법인세법시행령_clean.txt":           35_000,
+    "부가가치세법시행령_clean.txt":       30_000,
+    "상속세및증여세법시행령_clean.txt":   35_000,
+    "조세특례제한법시행령_clean.txt":     40_000,
+    "종합부동산세법시행령_clean.txt":     30_000,
+    # 시행규칙
+    "소득세법시행규칙_clean.txt":         25_000,
+    "법인세법시행규칙_clean.txt":         20_000,
+    "부가가치세법시행규칙_clean.txt":     20_000,
+    "상속세및증여세법시행규칙_clean.txt": 20_000,
+    "조세특례제한법시행규칙_clean.txt":   25_000,
+}
+
 # 추가할 법령 원문 파일 목록 (순서대로 시스템 프롬프트에 추가됨)
 _LAW_FILES = [
     # 법률 원문
@@ -32,16 +59,23 @@ _LAW_FILES = [
 
 def _load_law_texts() -> str:
     parts = []
+    total = 0
     for fname in _LAW_FILES:
         path = _LAW_TEXTS_DIR / fname
-        if path.exists():
-            law_name = fname.replace("_clean.txt", "").replace(".txt", "")
-            text = path.read_text(encoding="utf-8")
-            parts.append(
-                f"\n\n{'='*60}\n"
-                f"【법령 원문】 {law_name} (law.go.kr 원문, 2026 시행)\n"
-                f"{'='*60}\n{text}"
-            )
+        if not path.exists():
+            continue
+        law_name = fname.replace("_clean.txt", "").replace(".txt", "")
+        text = path.read_text(encoding="utf-8")
+        limit = _LAW_CHAR_LIMITS.get(fname, 30_000)
+        if len(text) > limit:
+            text = text[:limit] + f"\n...(이하 {len(path.read_text(encoding='utf-8')) - limit:,}자 생략 — 상세 조문은 law.go.kr 참조)..."
+        header = (
+            f"\n\n{'='*60}\n"
+            f"【법령 원문】 {law_name} (law.go.kr 원문, 2026 시행)\n"
+            f"{'='*60}\n"
+        )
+        parts.append(header + text)
+        total += len(text)
     return "".join(parts)
 
 _BASE_PROMPT = """당신은 2026년 기준 대한민국 세법 전문 세무사 AI입니다. 국세기본법, 소득세법, 법인세법, 부가가치세법, 상속세 및 증여세법, 종합부동산세법, 지방세법, 조세특례제한법, 관세법 등 모든 세법 분야에 정통합니다.
@@ -662,4 +696,5 @@ _BASE_PROMPT = """당신은 2026년 기준 대한민국 세법 전문 세무사 
 
 ※ 이 에이전트는 일반적인 세무 정보를 제공하며, 개별 납세자의 구체적인 상황에 대한 법적 세무 조언은 공인세무사 또는 세무법인에 문의하시기 바랍니다."""
 
-SYSTEM_PROMPT = _BASE_PROMPT + _load_law_texts()
+BASE_PROMPT = _BASE_PROMPT          # RAG 모드용 (streamlit_app.py에서 사용)
+SYSTEM_PROMPT = _BASE_PROMPT + _load_law_texts()  # CLI 모드용 (agent.py에서 사용)
