@@ -54,7 +54,7 @@ def main():
     if not voyage_key:
         print("VOYAGE_API_KEY 환경변수 없음 → BM25 인덱스만 생성")
 
-    # 1) 조문 분할
+    # 1) 법령 조문 분할
     all_chunks = []
     for fname in LAW_FILES:
         path = ROOT / fname
@@ -67,10 +67,27 @@ def main():
         all_chunks.extend(chunks)
         print(f"  {law_name}: {len(chunks)}개 조문")
 
+    print(f"\n법령 조문 소계: {len(all_chunks)}개")
+
+    # 2) 조세심판원 결정례 추가
+    cases_file = ROOT / "case_texts" / "all_cases.json"
+    if cases_file.exists():
+        with open(cases_file, encoding="utf-8") as f:
+            cases = json.load(f)
+        for c in cases:
+            all_chunks.append({
+                "law": f"조세심판결정례_{c['semok']}",
+                "article": c.get("case_num", ""),
+                "text": c.get("text", ""),
+            })
+        print(f"조세심판 결정례 추가: {len(cases)}건")
+    else:
+        print("결정례 파일 없음 (case_texts/all_cases.json)")
+
     out = ROOT / "law_chunks.json"
     with open(out, "w", encoding="utf-8") as f:
         json.dump(all_chunks, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"\nlaw_chunks.json: {len(all_chunks)}개 조문 ({out.stat().st_size/1024/1024:.1f} MB)")
+    print(f"\nlaw_chunks.json: 총 {len(all_chunks)}개 ({out.stat().st_size/1024/1024:.1f} MB)")
 
     # 2) Voyage AI 임베딩
     if not voyage_key:
