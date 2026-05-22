@@ -1,15 +1,21 @@
 """
-세무사 에이전트 A — 웹 버전 (RAG)
+세무사 에이전트 A — 웹 버전 (RAG + 대화 저장)
 Streamlit Cloud 배포용
 """
 
 import base64
 import io
+import json
+import uuid
+from datetime import datetime, timezone, timedelta
+
 import streamlit as st
 import anthropic
 from pathlib import Path
 from tax_knowledge_2026 import BASE_PROMPT
 from rag import LawRetriever
+
+KST = timezone(timedelta(hours=9))
 
 st.set_page_config(
     page_title="세무사 에이전트 A",
@@ -40,8 +46,23 @@ def get_client():
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 
+@st.cache_resource
+def get_supabase():
+    """Supabase 클라이언트 (SUPABASE_URL/KEY 없으면 None 반환)"""
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_KEY", "")
+    if not url or not key:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
 retriever = get_retriever()
 client = get_client()
+sb = get_supabase()
 
 
 # ── 파일 처리 ─────────────────────────────────────
@@ -100,18 +121,127 @@ def process_file(uploaded_file) -> dict | None:
     return None
 
 
-# ── 사이드바 ──────────────────────────────────────
+# ── 대화 저장 관련 ─────────────────────────────────
+def _sanitize_messages(messages: list) -> list:
+    """이미지/PDF 바이너리는 플레이스홀더로 교체 후 저장 (DB 용량 절약)"""
+    result = []
+    for msg in messages:
+        content = msg["content"]
+        if isinstance(content, list):
+            new_blocks = []
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "image":
+                    new_blocks.append({"type": "text", "text": "📷 [이미지 첨부 — 재열람 시 재첨부 필요]"})
+                elif isinstance(blk, dict) and blk.get("type") == "document":
+                    new_blocks.append({"type": "text", "text": "📄 [PDF 첨부 — 재열람 시 재첨부 필요]"})
+                else:
+                    new_blocks.append(blk)
+            result.append({"role": msg["role"], "content": new_blocks})
+        else:
+            result.append(msg)
+    return result
+
+
+def save_conversation(session_id: str, title: str, messages: list):
+    """Supabase에 대화 upsert (없으면 INSERT, 있으면 UPDATE)"""
+    if not sb or not messages:
+        return
+    try:
+        sanitized = _sanitize_messages(messages)
+        sb.table("conversations").upsert({
+            "session_id": session_id,
+            "title": title[:60],
+            "messages": sanitized,
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        }, on_conflict="session_id").execute()
+    except Exception as e:
+        st.toast(f"저장 오류: {e}", icon="⚠️")
+
+
+def load_conversations(limit: int = 30) -> list:
+    """최근 대화 목록 반환"""
+    if not sb:
+        return []
+    try:
+        res = (
+            sb.table("conversations")
+            .select("session_id, title, updated_at")
+            .order("updated_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def load_conversation_messages(session_id: str) -> list:
+    """특정 대화의 messages 반환"""
+    if not sb:
+        return []
+    try:
+        res = (
+            sb.table("conversations")
+            .select("messages")
+            .eq("session_id", session_id)
+            .single()
+            .execute()
+        )
+        return res.data.get("messages", []) if res.data else []
+    except Exception:
+        return []
+
+
+def _fmt_date(iso_str: str) -> str:
+    """UTC ISO → 한국시간 '05/22 14:30' 형식"""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(KST)
+        today = datetime.now(tz=KST).date()
+        if dt.date() == today:
+            return f"오늘 {dt:%H:%M}"
+        elif (today - dt.date()).days == 1:
+            return f"어제 {dt:%H:%M}"
+        else:
+            return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return iso_str[:10]
+
+
+# ── 세션 초기화 ────────────────────────────────────
 def _empty_stats():
     return {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "turns": 0}
 
 
+def _new_session():
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.messages = []
+    st.session_state.stats = _empty_stats()
+    st.session_state.conv_title = "새 대화"
+
+
+if "session_id" not in st.session_state:
+    _new_session()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "stats" not in st.session_state:
+    st.session_state.stats = _empty_stats()
+if "conv_title" not in st.session_state:
+    st.session_state.conv_title = "새 대화"
+
+
+# ── 사이드바 ──────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 메뉴")
 
-    if st.button("🗑️ 대화 초기화", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.stats = _empty_stats()
-        st.rerun()
+    col_new, col_del = st.columns(2)
+    with col_new:
+        if st.button("🆕 새 대화", use_container_width=True):
+            _new_session()
+            st.rerun()
+    with col_del:
+        if st.button("🗑️ 초기화", use_container_width=True):
+            _new_session()
+            st.rerun()
 
     st.divider()
 
@@ -128,14 +258,37 @@ with st.sidebar:
     st.divider()
     st.subheader("📊 토큰 사용량")
 
-    if "stats" in st.session_state:
-        s = st.session_state.stats
-        col1, col2 = st.columns(2)
-        col1.metric("대화 횟수", s["turns"])
-        col2.metric("출력 토큰", f"{s['output']:,}")
-        st.caption(
-            f"입력 {s['input']:,} | 캐시읽기 {s['cache_read']:,} | 캐시쓰기 {s['cache_write']:,}"
-        )
+    s = st.session_state.stats
+    col1, col2 = st.columns(2)
+    col1.metric("대화 횟수", s["turns"])
+    col2.metric("출력 토큰", f"{s['output']:,}")
+    st.caption(
+        f"입력 {s['input']:,} | 캐시읽기 {s['cache_read']:,} | 캐시쓰기 {s['cache_write']:,}"
+    )
+
+    # ── 대화 기록 ────────────────────────────────
+    if sb:
+        st.divider()
+        st.subheader("💾 대화 기록")
+        conv_list = load_conversations(30)
+        if conv_list:
+            for conv in conv_list:
+                sid = conv["session_id"]
+                title = conv.get("title", "새 대화")
+                date_str = _fmt_date(conv.get("updated_at", ""))
+                label = f"{date_str}  {title}"
+                is_current = sid == st.session_state.session_id
+                btn_type = "primary" if is_current else "secondary"
+                if st.button(label, key=f"conv_{sid}", use_container_width=True, type=btn_type):
+                    if not is_current:
+                        msgs = load_conversation_messages(sid)
+                        st.session_state.session_id = sid
+                        st.session_state.messages = msgs
+                        st.session_state.stats = _empty_stats()
+                        st.session_state.conv_title = title
+                        st.rerun()
+        else:
+            st.caption("저장된 대화가 없습니다.")
 
     st.divider()
     st.markdown(
@@ -149,14 +302,18 @@ with st.sidebar:
     )
 
 
-# ── 세션 초기화 ────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "stats" not in st.session_state:
-    st.session_state.stats = _empty_stats()
-
-
 # ── 대화 내역 출력 ─────────────────────────────────
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
 for msg in st.session_state.messages:
     avatar = "👤" if msg["role"] == "user" else "🏛️"
     with st.chat_message(msg["role"], avatar=avatar):
@@ -169,7 +326,6 @@ for msg in st.session_state.messages:
                     if block.get("type") == "text":
                         st.markdown(block["text"])
                     elif block.get("type") == "image":
-                        mime = block["source"]["media_type"]
                         img_data = base64.b64decode(block["source"]["data"])
                         st.image(img_data)
                     elif block.get("type") == "document":
@@ -182,30 +338,32 @@ for msg in st.session_state.messages:
 if prompt := st.chat_input("세금 관련 질문을 입력하세요..."):
     # 파일 첨부 여부에 따라 content 구성
     if uploaded_file is not None:
-        uploaded_file.seek(0)  # 파일 포인터 초기화
+        uploaded_file.seek(0)
         file_block = process_file(uploaded_file)
         if file_block:
-            user_content = [
-                file_block,
-                {"type": "text", "text": prompt},
-            ]
+            user_content = [file_block, {"type": "text", "text": prompt}]
         else:
             st.warning(f"지원하지 않는 파일 형식입니다: {uploaded_file.name}")
             user_content = prompt
     else:
         user_content = prompt
 
+    # 대화 제목: 첫 메시지로 설정
+    if not st.session_state.messages:
+        st.session_state.conv_title = (_extract_text(user_content) or "새 대화")[:40]
+
     st.session_state.messages.append({"role": "user", "content": user_content})
+
     with st.chat_message("user", avatar="👤"):
         if uploaded_file and isinstance(user_content, list):
-            name = uploaded_file.name.lower()
-            if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            fname = uploaded_file.name.lower()
+            if fname.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
                 for blk in user_content:
-                    if blk["type"] == "image":
+                    if isinstance(blk, dict) and blk.get("type") == "image":
                         st.image(base64.b64decode(blk["source"]["data"]))
-            elif name.endswith(".pdf"):
+            elif fname.endswith(".pdf"):
                 st.caption(f"📄 {uploaded_file.name}")
-            elif name.endswith((".xlsx", ".xls", ".csv")):
+            elif fname.endswith((".xlsx", ".xls", ".csv")):
                 st.caption(f"📊 {uploaded_file.name}")
         st.markdown(prompt)
 
@@ -215,16 +373,6 @@ if prompt := st.chat_input("세금 관련 질문을 입력하세요..."):
         status_placeholder.markdown("*⏳ 관련 조문 검색 중...*")
 
         # ── RAG: 관련 조문 검색 ─────────────────────
-        # 대화 마지막 3턴 + 현재 질문으로 검색 (문맥 반영)
-        def _extract_text(content):
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                return " ".join(
-                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-                )
-            return ""
-
         recent_ctx = " ".join(
             _extract_text(m["content"]) for m in st.session_state.messages[-6:]
         )
@@ -235,7 +383,7 @@ if prompt := st.chat_input("세금 관련 질문을 입력하세요..."):
             {
                 "type": "text",
                 "text": BASE_PROMPT,
-                "cache_control": {"type": "ephemeral"},  # BASE_PROMPT는 캐싱
+                "cache_control": {"type": "ephemeral"},
             }
         ]
         if retrieved:
@@ -282,3 +430,10 @@ if prompt := st.chat_input("세금 관련 질문을 입력하세요..."):
         s["turns"] += 1
 
     st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+    # ── 대화 자동 저장 ───────────────────────────
+    save_conversation(
+        st.session_state.session_id,
+        st.session_state.conv_title,
+        st.session_state.messages,
+    )
